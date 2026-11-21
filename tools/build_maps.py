@@ -13,18 +13,23 @@ maps/py/<path with / as __>.json, one per Python source file:
   f  per line: index in m of the fallback for code inserted at the line, or -1
   s  lines of a multi-line string, where a removed "comment" is really content
   i  lines where text inserted before them lands inside a multi-line string
+  t  class-level table or literal statements, as [first line, last line]
+  e  {line: [index in m of the tests reading that entry or -1, index in t]}
 maps/data.json: {path: hex bitmask} for files tests read as data or text
 """
 
 import ast
 import io
 import json
+import re
 import shutil
 import sqlite3
 import sys
 import tokenize
 from collections import defaultdict
 from pathlib import Path
+
+from table_scan import scan
 
 ROOT = Path(__file__).resolve().parent.parent
 CACHE = ROOT / ".cache"
@@ -147,6 +152,26 @@ def main() -> None:
     (MAPS / "py").mkdir(parents=True)
 
     doc_mask = by_file.get("tests/test_docs.py", 0)
+
+    # Which tests read each class-level entry. Tests are not instrumented, so a
+    # test file that names the attribute counts as reading all of it.
+    traced = json.loads((CACHE / "entries.json").read_text())
+    if traced["failed"] or traced["tests"] != len(tests):
+        raise SystemExit("entry trace is incomplete")
+    readers = {key: int(mask, 16) for key, mask in traced["entries"].items()}
+    table_entries = scan(src)["entries"]
+    test_text = {name: (src / name).read_text() for name in by_file}
+    named: dict[str, int] = {}
+
+    def naming_tests(name: str) -> int:
+        if name not in named:
+            pattern = re.compile(rf"\b{re.escape(name)}\b")
+            named[name] = 0
+            for file, text in test_text.items():
+                if pattern.search(text):
+                    named[name] |= by_file[file]
+        return named[name]
+
     for path in paths:
         source = (src / path).read_text()
         lines = run.get(path, {})
@@ -171,6 +196,19 @@ def main() -> None:
             "s": sorted(strings),
             "i": sorted(interior),
         }
+        statements, statement_index, by_line = [], {}, defaultdict(int)
+        line_statement = {}
+        for entry in table_entries.get(path, []):
+            span = tuple(entry["statement"])
+            if span not in statement_index:
+                statement_index[span] = len(statements)
+                statements.append(list(span))
+            mask = readers.get(entry["id"], 0) | naming_tests(entry["name"])
+            for line in range(entry["start"], entry["end"] + 1):
+                by_line[line] |= mask
+                line_statement[line] = statement_index[span]
+        record["t"] = statements
+        record["e"] = {str(line): [intern(by_line[line]), line_statement[line]] for line in sorted(line_statement)}
         record["m"] = masks
         (MAPS / "py" / (path.replace("/", "__") + ".json")).write_text(json.dumps(record, separators=(",", ":")))
 

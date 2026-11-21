@@ -4,6 +4,7 @@ No tests run here. The maps in maps/ come from tools/build_maps.py and hold only
 what was measured or parsed at the pinned commit.
 """
 
+import ast
 import json
 import re
 import sys
@@ -184,6 +185,114 @@ def replaced_positions(change: Change) -> set[int]:
     return replaced
 
 
+def shape(node):
+    """A node's structure with every constant's value erased."""
+    if isinstance(node, ast.Constant):
+        return "constant"
+    if isinstance(node, ast.AST):
+        return type(node).__name__, tuple((name, shape(getattr(node, name, None))) for name in node._fields)
+    if isinstance(node, list):
+        return tuple(shape(item) for item in node)
+    return node
+
+
+def is_safe_value_edit(old, new, source: str) -> bool:
+    """True when a table value's edit cannot raise while the class is being created."""
+    if shape(old) == shape(new):
+        return True  # only constants changed
+    if isinstance(old, ast.Lambda) and isinstance(new, ast.Lambda):
+        # A lambda's body runs only when a test reads the entry and calls it.
+        return not new.args.defaults and not any(new.args.kw_defaults)
+    names = []
+    for node in ast.walk(new):
+        if isinstance(node, ast.Call):
+            return False
+        if isinstance(node, ast.Name):
+            names.append(node.id)
+        elif isinstance(node, ast.Attribute):
+            names.append(node.attr)
+    return all(re.search(rf"\b{re.escape(name)}\b", source) for name in names)
+
+
+def parse_statement(lines: list[str]):
+    try:
+        body = ast.parse("if 1:\n" + "\n".join(lines)).body[0].body
+    except (SyntaxError, ValueError, IndexError):
+        return None
+    return body[0] if len(body) == 1 and isinstance(body[0], (ast.Assign, ast.AnnAssign)) else None
+
+
+def same_statement_edit(old, new, source: str) -> bool:
+    """True when a table keeps its keys, or only loses some, and its values stay safe."""
+    if old is None or new is None or type(old) is not type(new):
+        return False
+    old_target = old.targets if isinstance(old, ast.Assign) else old.target
+    new_target = new.targets if isinstance(new, ast.Assign) else new.target
+    if ast.dump(ast.Module(old_target if isinstance(old_target, list) else [old_target], [])) != \
+            ast.dump(ast.Module(new_target if isinstance(new_target, list) else [new_target], [])):
+        return False
+    if isinstance(old.value, ast.Dict) and isinstance(new.value, ast.Dict):
+        old_items = [(ast.dump(key) if key else None, value)
+                     for key, value in zip(old.value.keys, old.value.values)]
+        position = 0
+        for key, value in zip(new.value.keys, new.value.values):
+            wanted = ast.dump(key) if key else None
+            while position < len(old_items) and old_items[position][0] != wanted:
+                if old_items[position][0] is None:
+                    return False  # a ** spread was removed
+                position += 1
+            if position == len(old_items):
+                return False  # a key was added or changed
+            previous = old_items[position][1]
+            position += 1
+            if wanted is None:
+                if ast.dump(previous) != ast.dump(value):
+                    return False
+            elif not is_safe_value_edit(previous, value, source):
+                return False
+        return all(key is not None for key, _ in old_items[position:])
+    try:
+        ast.literal_eval(old.value)
+        ast.literal_eval(new.value)
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        return False
+    return True
+
+
+def narrow_table_edit(change: Change, record: dict) -> int | None:
+    """Tests reading the edited table entries, or None when the edit is not eligible."""
+    entries = record["e"]
+    if not change.removed or any(str(line) not in entries for line in change.removed):
+        return None
+    replaced = replaced_positions(change)
+    if any(line not in replaced for line, _ in change.inserted):
+        return None
+    groups: dict[int, list[str]] = {}
+    for line, text in change.inserted:
+        groups.setdefault(line, []).append(text)
+    replacement = {line - len(texts) + offset: text for line, texts in groups.items()
+                   for offset, text in enumerate(texts)}
+    try:
+        source = (SOURCE / change.path).read_text()
+    except (OSError, UnicodeDecodeError):
+        return None
+    original = source.split("\n")
+    removed = set(change.removed)
+    mask = 0
+    for index in {entries[str(line)][1] for line in change.removed}:
+        first, last = record["t"][index]
+        old_lines = original[first - 1:last]
+        new_lines = [replacement.get(number, original[number - 1]) for number in range(first, last + 1)
+                     if number not in removed or number in replacement]
+        if not same_statement_edit(parse_statement(old_lines), parse_statement(new_lines), source):
+            return None
+    for line in change.removed:
+        position = entries[str(line)][0]
+        if position >= 0:
+            mask |= record["m"][position]
+    return mask
+
+
 def select_python(change: Change, record: dict, maps: Maps) -> int:
     strings = record["s"]
     removed = [text for line, text in zip(change.removed, change.removed_text)
@@ -199,6 +308,10 @@ def select_python(change: Change, record: dict, maps: Maps) -> int:
         return maps.run_all("init_or_conftest")  # package exports and dialect registration
     if change.path.startswith("tests/") and not is_test_module(change.path):
         return maps.run_all("test_helper")  # helpers shared across test files
+
+    narrowed = narrow_table_edit(change, record)
+    if narrowed is not None:
+        return narrowed
 
     mask = 0
     if any(text.strip().startswith(DEFINES) for text in removed + added):
