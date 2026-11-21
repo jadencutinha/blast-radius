@@ -164,6 +164,26 @@ def is_test_module(path: str) -> bool:
     return path.startswith("tests/") and path.rsplit("/", 1)[-1].startswith("test_")
 
 
+def replaced_positions(change: Change) -> set[int]:
+    """Insert positions whose lines replace removed code one for one at the same indent.
+
+    Such a line runs exactly when the line it replaces ran, so the removed line's
+    tests already cover it.
+    """
+    old = dict(zip(change.removed, change.removed_text))
+    groups: dict[int, list[str]] = {}
+    for line, text in change.inserted:
+        groups.setdefault(line, []).append(text)
+    indent = lambda text: len(text) - len(text.lstrip())
+    replaced = set()
+    for line, texts in groups.items():
+        before = [old.get(line - len(texts) + offset) for offset in range(len(texts))]
+        if all(item is not None and is_code(item) and is_code(text) and indent(item) == indent(text)
+               for item, text in zip(before, texts)):
+            replaced.add(line)
+    return replaced
+
+
 def select_python(change: Change, record: dict, maps: Maps) -> int:
     strings = record["s"]
     removed = [text for line, text in zip(change.removed, change.removed_text)
@@ -190,8 +210,9 @@ def select_python(change: Change, record: dict, maps: Maps) -> int:
         if found is None:
             return maps.run_all("line_past_map")
         mask |= found
+    replaced = replaced_positions(change)
     for line, text in change.inserted:
-        if not is_code(text) and line not in interior:
+        if line in replaced or (not is_code(text) and line not in interior):
             continue
         here, before = at(record, "x", line), at(record, "x", line - 1)
         fallback = at(record, "f", line)
