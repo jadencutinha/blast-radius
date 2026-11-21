@@ -11,7 +11,8 @@ maps/py/<path with / as __>.json, one per Python source file:
   m  distinct test sets, each a hex bitmask over test numbers
   x  per line: index in m of the tests to run if the line is changed, or -1
   f  per line: index in m of the fallback for code inserted at the line, or -1
-  s  lines inside a multi-line string, where a "comment" is really content
+  s  lines of a multi-line string, where a removed "comment" is really content
+  i  lines where text inserted before them lands inside a multi-line string
 maps/data.json: {path: hex bitmask} for files tests read as data or text
 """
 
@@ -46,7 +47,7 @@ def load_isolated():
 
 
 def comment_and_string_lines(source: str):
-    comments, strings = set(), set()
+    comments, strings, interior = set(), set(), set()
     code = set()
     for token in tokenize.generate_tokens(io.StringIO(source).readline):
         if token.type == tokenize.COMMENT:
@@ -61,14 +62,15 @@ def comment_and_string_lines(source: str):
             ):
                 if token.end[0] > token.start[0]:
                     strings.update(range(token.start[0], token.end[0] + 1))
-    return comments - code, code, strings
+                    interior.update(range(token.start[0] + 1, token.end[0] + 1))
+    return comments - code, code, strings, interior
 
 
 def line_rules(source, run, wide, doc_mask):
     """Per line: (mask if changed, fallback mask for code inserted there)."""
     count = source.count("\n") + 2
     tree = ast.parse(source)
-    comments, code, _ = comment_and_string_lines(source)
+    comments, code, _, _ = comment_and_string_lines(source)
     function_of = [None] * (count + 1)
     statement_of = [None] * (count + 1)
     docstrings = set()
@@ -152,7 +154,7 @@ def main() -> None:
         for mask in lines.values():
             wide |= mask
         change, insert, count = line_rules(source, lines, wide, doc_mask)
-        _, _, strings = comment_and_string_lines(source)
+        _, _, strings, interior = comment_and_string_lines(source)
         masks, index = [], {}
 
         def intern(mask):
@@ -167,6 +169,7 @@ def main() -> None:
             "x": [intern(change[line]) for line in range(1, count + 1)],
             "f": [intern(insert[line]) for line in range(1, count + 1)],
             "s": sorted(strings),
+            "i": sorted(interior),
         }
         record["m"] = masks
         (MAPS / "py" / (path.replace("/", "__") + ".json")).write_text(json.dumps(record, separators=(",", ":")))

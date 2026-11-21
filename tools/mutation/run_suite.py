@@ -21,8 +21,9 @@ PRISTINE = Path("/pristine")
 RESULTS = Path("/out/mutation_results.jsonl")
 REPORT = "/tmp/mutation_report.json"
 HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
-TEST_TIMEOUT = 240
-RUN_TIMEOUT = 480
+TEST_TIMEOUT = 90
+RUN_TIMEOUT = 300
+RESOLVE_TIMEOUT = 240
 
 
 def apply_patch(text: str) -> list[str]:
@@ -95,17 +96,17 @@ def restore(paths: list[str]) -> None:
             current.unlink()
 
 
-def run_suite(tests: list[dict]) -> tuple[list[int], str]:
+def run_pytest(targets: list[str], per_test: int, limit: int) -> tuple[set[str], set[str], str]:
     Path(REPORT).unlink(missing_ok=True)
     env = dict(os.environ, MUTATION_REPORT=REPORT, SKIP_INTEGRATION="0", PYTHONPATH="/src:/tools/mutation",
                PYTHONDONTWRITEBYTECODE="1")
-    command = [sys.executable, "-m", "pytest", "tests", "-n", "4", "-q", "-p", "report_plugin",
-               "-p", "no:cacheprovider", f"--timeout={TEST_TIMEOUT}"]
+    command = [sys.executable, "-m", "pytest", *targets, "-n", "4", "-q", "-p", "report_plugin",
+               "-p", "no:cacheprovider", f"--timeout={per_test}"]
     process = subprocess.Popen(command, cwd=SRC, env=env, stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL, start_new_session=True)
     status = "ok"
     try:
-        process.wait(RUN_TIMEOUT)
+        process.wait(limit)
     except subprocess.TimeoutExpired:
         status = "run_timeout"
     finally:
@@ -114,11 +115,29 @@ def run_suite(tests: list[dict]) -> tuple[list[int], str]:
         except ProcessLookupError:
             pass
         process.wait()
-    if not Path(REPORT).exists():
-        return [test["number"] for test in tests], "no_report" if status == "ok" else status
-    report = json.loads(Path(REPORT).read_text())
-    passed, failed = set(report["passed"]), set(report["failed"])
-    return [test["number"] for test in tests if test["id"] in failed or test["id"] not in passed], status
+    passed, failed = set(), set()
+    if Path(REPORT).exists():
+        for row in Path(REPORT).read_text().splitlines():
+            outcome, _, nodeid = row.partition("\t")
+            (failed if outcome == "F" else passed).add(nodeid)
+    return passed, failed, status
+
+
+def run_suite(tests: list[dict]) -> tuple[list[int], str, list[int]]:
+    """Failing test numbers, the status, and tests whose outcome stayed unknown."""
+    passed, failed, status = run_pytest(["tests"], TEST_TIMEOUT, RUN_TIMEOUT)
+    if status == "ok":
+        return [t["number"] for t in tests if t["id"] in failed or t["id"] not in passed], status, []
+    # A hang used up the time limit. Run what never reported, with short limits.
+    for slow in (False, True):
+        group = [t["id"] for t in tests if t["id"] not in passed and t["id"] not in failed
+                 and (t["seconds"] > 3) == slow]
+        if group:
+            more_passed, more_failed, _ = run_pytest(group, 90 if slow else 15, RESOLVE_TIMEOUT)
+            passed |= more_passed
+            failed |= more_failed
+    unresolved = [t["number"] for t in tests if t["id"] not in passed and t["id"] not in failed]
+    return [t["number"] for t in tests if t["id"] in failed], status, unresolved
 
 
 def main() -> None:
@@ -136,18 +155,17 @@ def main() -> None:
             break
         started = time.time()
         touched: list[str] = []
+        unresolved: list[int] = []
         try:
             if name != "baseline":
                 touched = apply_patch(Path(f"/mutants/{name}.patch").read_text())
-            failing, status = run_suite(tests)
+            failing, status, unresolved = run_suite(tests)
         except (ValueError, OSError, IndexError, TypeError) as error:
             failing, status = [], f"apply_failed: {error}"
         finally:
-            for path in touched:
-                pass
             restore(touched)
         with RESULTS.open("a") as handle:
-            handle.write(json.dumps({"id": name, "failing": failing, "status": status,
+            handle.write(json.dumps({"id": name, "failing": failing, "unresolved": unresolved, "status": status,
                                      "seconds": round(time.time() - started, 1)}) + "\n")
         ran += 1
         print(f"{name} {status} failing={len(failing)} {time.time() - started:.0f}s", flush=True)

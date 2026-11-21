@@ -3,10 +3,17 @@
 Usage:
   python3 tools/mutation/evaluate.py <sqlglot checkout>          report by kind
   python3 tools/mutation/evaluate.py <sqlglot checkout> --order  write the run order
+  add --selector <commit> or --selector working to score another selector
 
+Scores the frozen selector in .cache/frozen/<commit> unless told otherwise, and
+writes the report to .cache/mutation_progress.txt. The suite results do not
+depend on the selector, so a changed rule is rescored here without rerunning.
 Only reads results to score the rules. Nothing here feeds maps/ or selector.py.
 """
 
+import contextlib
+import importlib.util
+import io
 import json
 import random
 import sys
@@ -14,11 +21,23 @@ from collections import defaultdict
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
-import selector  # noqa: E402
-
 MUTANTS = ROOT / ".cache" / "mutants"
 RESULTS = ROOT / ".cache" / "mutation_results.jsonl"
+FROZEN = ROOT / ".cache" / "frozen"
+PROGRESS = ROOT / ".cache" / "mutation_progress.txt"
+selector = None
+selector_name = ""
+
+
+def load_selector() -> None:
+    global selector, selector_name
+    name = sys.argv[sys.argv.index("--selector") + 1] if "--selector" in sys.argv \
+        else (FROZEN / "current").read_text().strip()
+    path = ROOT / "selector.py" if name == "working" else FROZEN / name / "selector.py"
+    spec = importlib.util.spec_from_file_location("frozen_selector", path)
+    selector = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(selector)
+    selector_name = name
 
 
 def setup(source: str):
@@ -38,8 +57,8 @@ def write_order(maps) -> None:
     narrow = [item["id"] for item in index if chosen(item["id"], maps) != maps.every]
     wide = [item["id"] for item in index if chosen(item["id"], maps) == maps.every]
     samples = sorted(path.stem for path in MUTANTS.glob("sample_*.patch"))
-    (MUTANTS / "order.txt").write_text("\n".join(["baseline"] + samples + narrow + wide) + "\n")
-    print(f"{len(narrow)} patches with a narrowed selection run first, then {len(wide)} that run every test")
+    (MUTANTS / "order.txt").write_text("\n".join(["baseline"] + samples + wide + narrow) + "\n")
+    print(f"{len(wide)} patches the selector runs in full go first, then {len(narrow)} narrowed ones")
 
 
 def cost(mask: int, millis) -> float:
@@ -56,6 +75,7 @@ def report(tests, maps) -> None:
     stats = defaultdict(lambda: defaultdict(float))
     missed = []
     label_errors = []
+    unresolved = []
     for row in RESULTS.read_text().splitlines():
         result = json.loads(row)
         name = result["id"]
@@ -75,6 +95,11 @@ def report(tests, maps) -> None:
         mask = chosen(name, maps)
         failing = set(result["failing"])
         lost = sorted(n for n in failing if not mask >> n & 1)
+        unknown = [n for n in result.get("unresolved", []) if not mask >> n & 1]
+        if unknown and not lost:
+            entry = stats[kind]
+            entry["unresolved"] += 1
+            unresolved.append((kind, name, len(unknown)))
         entry = stats[kind]
         entry["patches"] += 1
         entry["break"] += bool(failing)
@@ -85,6 +110,9 @@ def report(tests, maps) -> None:
             missed.append((kind, name, len(failing), len(lost), tests[lost[0]]["id"].split("/")[-1],
                            result["status"]))
 
+    total = sum(1 for line in (MUTANTS / "order.txt").read_text().splitlines() if line.strip())
+    finished = len(RESULTS.read_text().splitlines())
+    print(f"selector {selector_name}: {finished}/{total} runs finished (includes baseline and samples)")
     print(f"{'kind':<20}{'patches':>8}{'break':>7}{'missed':>7}{'run-all':>8}{'avg s':>7}")
     totals = defaultdict(float)
     for kind in sorted(stats):
@@ -96,16 +124,23 @@ def report(tests, maps) -> None:
     print(f"{'TOTAL':<20}{int(totals['patches']):>8}{int(totals['break']):>7}{int(totals['missed']):>7}"
           f"{int(totals['all']):>8}{totals['cost'] / max(totals['patches'], 1):>7.1f}")
     print("harness labels differing from sample answers:", label_errors)
-    for item in missed:
+    print("unresolved (a hang left unselected tests with no outcome):", unresolved)
+    print("misses by kind (kind, patch, failing, missed, first missed test, status):")
+    for item in sorted(missed):
         print("MISS", *item)
 
 
 def main() -> None:
+    load_selector()
     tests, maps = setup(sys.argv[1])
     if "--order" in sys.argv:
         write_order(maps)
-    else:
+        return
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
         report(tests, maps)
+    PROGRESS.write_text(buffer.getvalue())
+    print(buffer.getvalue(), end="")
 
 
 if __name__ == "__main__":

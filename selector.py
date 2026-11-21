@@ -105,6 +105,11 @@ class Maps:
             self.by_file[test["file"]] = self.by_file.get(test["file"], 0) | 1 << test["number"]
         self.data = json.loads((MAPS / "data.json").read_text())
         self.files: dict[str, dict | None] = {}
+        self.fired: list[str] = []  # which run-all rules fired, for tools/mutation
+
+    def run_all(self, rule: str) -> int:
+        self.fired.append(rule)
+        return self.every
 
     def source(self, path: str):
         if path not in self.files:
@@ -113,6 +118,7 @@ class Maps:
                 record = json.loads(target.read_text())
                 record["m"] = [int(mask, 16) for mask in record["m"]]
                 record["s"] = set(record["s"])
+                record["i"] = set(record["i"])
                 self.files[path] = record
             else:
                 self.files[path] = None
@@ -162,34 +168,35 @@ def select_python(change: Change, record: dict, maps: Maps) -> int:
     strings = record["s"]
     removed = [text for line, text in zip(change.removed, change.removed_text)
                if is_code(text) or line in strings]
-    added = [text for line, text in change.inserted if is_code(text) or line in strings]
+    interior = record["i"]
+    added = [text for line, text in change.inserted if is_code(text) or line in interior]
     if not removed and not added:
         return 0  # only blank lines and comments outside any string
     if not still_compiles(change):
-        return maps.every
+        return maps.run_all("syntax_error")
     name = change.path.rsplit("/", 1)[-1]
     if name == "__init__.py" or name == "conftest.py":
-        return maps.every  # package exports and dialect registration
+        return maps.run_all("init_or_conftest")  # package exports and dialect registration
     if change.path.startswith("tests/") and not is_test_module(change.path):
-        return maps.every  # helpers shared across test files
+        return maps.run_all("test_helper")  # helpers shared across test files
 
     mask = 0
     if any(text.strip().startswith(DEFINES) for text in removed + added):
         if not is_test_module(change.path):
-            return maps.every
+            return maps.run_all("defines_name")
         mask |= maps.by_file.get(change.path, maps.every)
     for line in change.removed:
         found = at(record, "x", line)
         if found is None:
-            return maps.every
+            return maps.run_all("line_past_map")
         mask |= found
     for line, text in change.inserted:
-        if not is_code(text) and line not in strings:
+        if not is_code(text) and line not in interior:
             continue
         here, before = at(record, "x", line), at(record, "x", line - 1)
         fallback = at(record, "f", line)
         if here is None or fallback is None:
-            return maps.every
+            return maps.run_all("line_past_map")
         mask |= here | (before or 0) | fallback
     return mask
 
@@ -200,23 +207,23 @@ def is_safe(path: str, maps: Maps) -> bool:
 
 def select(changes: list[Change] | None, maps: Maps) -> int:
     if changes is None:
-        return maps.every
+        return maps.run_all("unparseable")
     mask = 0
     for change in changes:
         if all(is_safe(path, maps) for path in change.paths):
             continue
         if change.whole_file:
-            return maps.every
+            return maps.run_all("whole_file")
         path = change.path
         if path in maps.data:
             mask |= int(maps.data[path], 16)  # read as data or as source text
         if path.endswith(".py"):
             record = maps.source(path)
             if record is None:
-                return maps.every
+                return maps.run_all("unknown_python")
             mask |= select_python(change, record, maps)
         elif path not in maps.data:
-            return maps.every
+            return maps.run_all("unknown_file")
     return mask
 
 
