@@ -1,1 +1,0 @@
-{"tests": 1620, "directories": ["sqlglot", "sqlglot/dialects", "sqlglot/executor", "sqlglot/expressions", "sqlglot/generators", "sqlglot/optimizer", "sqlglot/parsers", "sqlglot/typing", "tests", "tests/dialects", "tests/fixtures", "tests/fixtures/jsonpath", "tests/fixtures/optimizer", "tests/fixtures/optimizer/tpc-ds", "tests/fixtures/optimizer/tpc-h", "tests/sqlglot"]}

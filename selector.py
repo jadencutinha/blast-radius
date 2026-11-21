@@ -10,26 +10,37 @@ import sys
 from pathlib import Path
 
 DATA = Path("/data")
-MAPS = Path(__file__).resolve().parent / "maps"
+HERE = Path(__file__).resolve().parent
+MAPS = HERE / "maps"
+SOURCE = HERE / "src"
 MAX_WORKERS = 8
 WORKER_COST_MS = 2000
 
 HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
-ROOT_CONFIG = {"pyproject.toml", "setup.cfg", "setup.py", "tox.ini", "pytest.ini", "conftest.py"}
-# Added code that defines or imports names can matter anywhere the module is used.
+# Added or removed code that defines or imports names can matter wherever the
+# module is used, including through dispatch by method name.
 DEFINES = ("def ", "async def ", "class ", "@", "import ", "from ")
+# Paths no test can depend on, unless the maps recorded a test reading them.
+SAFE_PREFIXES = ("posts/", ".github/", "benchmarks/")
+SAFE_FILES = {
+    "README.md", "CHANGELOG.md", "CONTRIBUTING.md", "AGENTS.md", "CLAUDE.md", "LICENSE",
+    "sqlglot.png", ".gitignore", ".gitpod.yml", ".pre-commit-config.yaml",
+}
 
 
 class Change:
     def __init__(self, old: str, new: str) -> None:
-        self.path = new if old == "/dev/null" else old
-        self.whole_file = old == "/dev/null" or new == "/dev/null" or old != new
+        self.path = old
+        self.paths = {old, new}
+        self.whole_file = old != new  # rename or copy
+        self.has_hunk = False
         self.removed: list[int] = []
         self.removed_text: list[str] = []
         self.inserted: list[tuple[int, str]] = []
 
 
-def parse(text: str) -> list[Change]:
+def parse(text: str) -> list[Change] | None:
+    """The patch's file changes, or None when it cannot be read with confidence."""
     changes: list[Change] = []
     lines = text.split("\n")
     index = 0
@@ -38,30 +49,30 @@ def parse(text: str) -> list[Change]:
         line = lines[index]
         index += 1
         if line.startswith("diff --git "):
-            match = re.match(r"diff --git a/(.+) b/(.+)$", line)
-            current = Change(match[1], match[2]) if match else None
-            if current:
-                changes.append(current)
-        elif current and line.startswith("--- "):
-            old = line[4:].split("\t")[0]
-            if old == "/dev/null":
-                current.whole_file = True
-        elif current and line.startswith("+++ "):
-            if line[4:].split("\t")[0] == "/dev/null":
-                current.whole_file = True
-        elif current and (line.startswith("Binary files") or line.startswith("GIT binary")):
+            match = re.fullmatch(r"diff --git a/(.+) b/(.+)", line)
+            if not match:
+                return None  # quoted or unusual paths
+            current = Change(match[1], match[2])
+            changes.append(current)
+        elif current is None:
+            continue
+        elif line.startswith(("--- /dev/null", "+++ /dev/null", "Binary files", "GIT binary",
+                              "old mode", "new mode", "new file", "deleted file", "rename ",
+                              "copy ", "similarity ")):
             current.whole_file = True
-        elif current and line.startswith("@@ "):
+        elif line.startswith("@@ "):
             hunk = HUNK.match(line)
             if not hunk:
-                current.whole_file = True
-                continue
+                return None
+            current.has_hunk = True
             old_line = int(hunk[1])
             old_left = int(hunk[2]) if hunk[2] is not None else 1
             new_left = int(hunk[4]) if hunk[4] is not None else 1
             if old_left == 0:
                 old_line += 1  # git names the line before a pure insertion
-            while (old_left > 0 or new_left > 0) and index < len(lines):
+            while old_left > 0 or new_left > 0:
+                if index >= len(lines):
+                    return None  # truncated hunk
                 body = lines[index]
                 index += 1
                 if body.startswith("\\"):
@@ -78,12 +89,20 @@ def parse(text: str) -> list[Change]:
                     old_line += 1
                     old_left -= 1
                     new_left -= 1
+    if not changes and text.strip():
+        return None
+    for change in changes:
+        if not change.has_hunk:
+            change.whole_file = True
     return changes
 
 
 class Maps:
-    def __init__(self, test_count: int) -> None:
-        self.every = (1 << test_count) - 1
+    def __init__(self, tests: list[dict]) -> None:
+        self.every = (1 << len(tests)) - 1
+        self.by_file: dict[str, int] = {}
+        for test in tests:
+            self.by_file[test["file"]] = self.by_file.get(test["file"], 0) | 1 << test["number"]
         self.data = json.loads((MAPS / "data.json").read_text())
         self.files: dict[str, dict | None] = {}
 
@@ -113,40 +132,60 @@ def is_code(text: str) -> bool:
     return bool(stripped) and not stripped.startswith("#")
 
 
-def balance(lines: list[str]) -> tuple[int, int, int]:
-    joined = "".join(lines)
-    return (
-        joined.count("(") - joined.count(")"),
-        joined.count("[") - joined.count("]"),
-        joined.count("{") - joined.count("}"),
-    )
+def still_compiles(change: Change) -> bool:
+    """Apply the change to the pinned source and compile it."""
+    try:
+        original = (SOURCE / change.path).read_text().split("\n")
+    except (OSError, UnicodeDecodeError):
+        return False
+    removed = set(change.removed)
+    inserted: dict[int, list[str]] = {}
+    for line, text in change.inserted:
+        inserted.setdefault(line, []).append(text)
+    result: list[str] = []
+    for number in range(1, len(original) + 2):
+        result.extend(inserted.get(number, ()))
+        if number <= len(original) and number not in removed:
+            result.append(original[number - 1])
+    try:
+        compile("\n".join(result), change.path, "exec", dont_inherit=True)
+    except (SyntaxError, ValueError):
+        return False
+    return True
 
 
-def may_break_module(change: Change) -> bool:
-    """True when an edit changes brackets or indentation, so the file may not import."""
-    old = [text for text in change.removed_text if is_code(text)]
-    new = [text for _, text in change.inserted if is_code(text)]
-    if balance(old) != balance(new):
-        return True
-    indent = lambda text: len(text) - len(text.lstrip())
-    return len(old) == len(new) and sorted(map(indent, old)) != sorted(map(indent, new))
+def is_test_module(path: str) -> bool:
+    return path.startswith("tests/") and path.rsplit("/", 1)[-1].startswith("test_")
 
 
 def select_python(change: Change, record: dict, maps: Maps) -> int:
-    if may_break_module(change):
+    strings = record["s"]
+    removed = [text for line, text in zip(change.removed, change.removed_text)
+               if is_code(text) or line in strings]
+    added = [text for line, text in change.inserted if is_code(text) or line in strings]
+    if not removed and not added:
+        return 0  # only blank lines and comments outside any string
+    if not still_compiles(change):
         return maps.every
+    name = change.path.rsplit("/", 1)[-1]
+    if name == "__init__.py" or name == "conftest.py":
+        return maps.every  # package exports and dialect registration
+    if change.path.startswith("tests/") and not is_test_module(change.path):
+        return maps.every  # helpers shared across test files
 
     mask = 0
+    if any(text.strip().startswith(DEFINES) for text in removed + added):
+        if not is_test_module(change.path):
+            return maps.every
+        mask |= maps.by_file.get(change.path, maps.every)
     for line in change.removed:
         found = at(record, "x", line)
         if found is None:
             return maps.every
         mask |= found
     for line, text in change.inserted:
-        if not is_code(text) and line not in record["s"]:
-            continue  # a blank or comment line outside any string runs nothing
-        if text.strip().startswith(DEFINES):
-            return maps.every
+        if not is_code(text) and line not in strings:
+            continue
         here, before = at(record, "x", line), at(record, "x", line - 1)
         fallback = at(record, "f", line)
         if here is None or fallback is None:
@@ -155,17 +194,29 @@ def select_python(change: Change, record: dict, maps: Maps) -> int:
     return mask
 
 
-def select(changes: list[Change], maps: Maps) -> int:
+def is_safe(path: str, maps: Maps) -> bool:
+    return path not in maps.data and (path in SAFE_FILES or path.startswith(SAFE_PREFIXES))
+
+
+def select(changes: list[Change] | None, maps: Maps) -> int:
+    if changes is None:
+        return maps.every
     mask = 0
     for change in changes:
+        if all(is_safe(path, maps) for path in change.paths):
+            continue
+        if change.whole_file:
+            return maps.every
         path = change.path
-        record = maps.source(path) if path.endswith(".py") else None
-        if record is not None and not change.whole_file:
+        if path in maps.data:
+            mask |= int(maps.data[path], 16)  # read as data or as source text
+        if path.endswith(".py"):
+            record = maps.source(path)
+            if record is None:
+                return maps.every
             mask |= select_python(change, record, maps)
-        elif path in maps.data and not change.whole_file:
-            mask |= int(maps.data[path], 16)
-        elif path in ROOT_CONFIG or path.endswith(".py") or path.startswith(("sqlglot/", "tests/")):
-            mask |= maps.every
+        elif path not in maps.data:
+            return maps.every
     return mask
 
 
@@ -199,7 +250,7 @@ def pack(selected: list[int], millis: list[int]) -> list[list[int]]:
 def main() -> None:
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     millis = [round(test["seconds"] * 1000) for test in tests]
-    maps = Maps(len(tests))
+    maps = Maps(tests)
     selected_total = 0
     patches = sorted((DATA / "commits").glob("*.patch"))
     for patch in patches:
