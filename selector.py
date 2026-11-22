@@ -5,6 +5,7 @@ what was measured or parsed at the pinned commit.
 """
 
 import ast
+import importlib.util
 import json
 import re
 import sys
@@ -107,6 +108,7 @@ class Maps:
         self.data = json.loads((MAPS / "data.json").read_text())
         self.files: dict[str, dict | None] = {}
         self.fired: list[str] = []  # which run-all rules fired, for tools/mutation
+        self.source_words: set[bytes] | None = None  # filled only when a patch needs it
 
     def run_all(self, rule: str) -> int:
         self.fired.append(rule)
@@ -139,12 +141,12 @@ def is_code(text: str) -> bool:
     return bool(stripped) and not stripped.startswith("#")
 
 
-def still_compiles(change: Change) -> bool:
-    """Apply the change to the pinned source and compile it."""
+def patched_text(change: Change) -> str | None:
+    """The file after the change, or None when the pinned source cannot be read."""
     try:
         original = (SOURCE / change.path).read_text().split("\n")
     except (OSError, UnicodeDecodeError):
-        return False
+        return None
     removed = set(change.removed)
     inserted: dict[int, list[str]] = {}
     for line, text in change.inserted:
@@ -154,11 +156,71 @@ def still_compiles(change: Change) -> bool:
         result.extend(inserted.get(number, ()))
         if number <= len(original) and number not in removed:
             result.append(original[number - 1])
+    return "\n".join(result)
+
+
+def still_compiles(change: Change) -> bool:
+    """Apply the change to the pinned source and compile it."""
+    text = patched_text(change)
+    if text is None:
+        return False
     try:
-        compile("\n".join(result), change.path, "exec", dont_inherit=True)
+        compile(text, change.path, "exec", dont_inherit=True)
     except (SyntaxError, ValueError):
         return False
     return True
+
+
+def name_is_unused(name: str, maps: "Maps") -> bool:
+    """True when the name appears in no pinned Python file, so nothing can refer to it."""
+    if maps.source_words is None:
+        words: set[bytes] = set()
+        for path in SOURCE.rglob("*.py"):
+            words.update(re.findall(rb"\w+", path.read_bytes()))
+        maps.source_words = words
+    return name.encode() not in maps.source_words
+
+
+def is_inert_statement(node, future_annotations: bool, maps: "Maps") -> bool:
+    """True for a new function that never runs, or a new import that cannot fail."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        args = node.args
+        every = args.posonlyargs + args.args + args.kwonlyargs + [a for a in (args.vararg, args.kwarg) if a]
+        annotated = node.returns is not None or any(a.annotation is not None for a in every)
+        doc = ast.get_docstring(node) or ""
+        return not (node.decorator_list or args.defaults or any(args.kw_defaults)
+                    or (annotated and not future_annotations) or ">>>" in doc
+                    or node.name.startswith("__")) and name_is_unused(node.name, maps)
+    if isinstance(node, ast.Import) and len(node.names) == 1:
+        item = node.names[0]
+        return (item.name in sys.stdlib_module_names and not item.name.startswith("_")
+                and item.name not in ("this", "antigravity")
+                and importlib.util.find_spec(item.name) is not None
+                and name_is_unused(item.asname or item.name, maps))
+    return False
+
+
+def only_adds_inert_code(change: Change, maps: "Maps") -> bool:
+    """True when the module is unchanged apart from new unused top-level functions or imports."""
+    if change.removed or not change.path.startswith("sqlglot/"):
+        return False
+    text = patched_text(change)
+    try:
+        old = ast.parse((SOURCE / change.path).read_text()).body
+        new = ast.parse(text).body
+    except (OSError, UnicodeDecodeError, SyntaxError, ValueError, TypeError):
+        return False
+    if len(new) <= len(old) or (old and ast.dump(old[0]) != ast.dump(new[0])):
+        return False  # keeps the module docstring and any __future__ import first
+    future = any(isinstance(node, ast.ImportFrom) and node.module == "__future__"
+                 and any(item.name == "annotations" for item in node.names) for node in old)
+    position = 0
+    for node in new:
+        if position < len(old) and ast.dump(node) == ast.dump(old[position]):
+            position += 1
+        elif not is_inert_statement(node, future, maps):
+            return False
+    return position == len(old)
 
 
 def is_test_module(path: str) -> bool:
@@ -308,6 +370,8 @@ def select_python(change: Change, record: dict, maps: Maps) -> int:
         return maps.run_all("init_or_conftest")  # package exports and dialect registration
     if change.path.startswith("tests/") and not is_test_module(change.path):
         return maps.run_all("test_helper")  # helpers shared across test files
+    if only_adds_inert_code(change, maps):
+        return 0
 
     narrowed = narrow_table_edit(change, record)
     if narrowed is not None:
